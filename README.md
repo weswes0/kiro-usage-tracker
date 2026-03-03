@@ -10,11 +10,7 @@ Real-time terminal dashboard with session archiving that persists across `/clear
 # install uv if you don't have it
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# install kiro-usage
-uv tool install kiro-usage
-
-# start the background archiver (runs at login, captures sessions continuously)
-kiro-usage install
+uv tool install kiro-usage && kiro-usage install
 ```
 
 ## Usage
