@@ -4,7 +4,7 @@ Reads archived sessions from ~/.kiro_sessions/ and live DB,
 renders a TUI dashboard with token usage, costs, and session details.
 """
 
-import json, sys, os, time, signal
+import json, sys, os, time, signal, platform
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -283,7 +283,10 @@ def render(days):
         L.append("  " + c("Estimated cost: ", "dim") +
                  c(fmt_cost(cli_total_cost), "bold", "red"))
 
-    if any(SESSIONS_DIR.glob("*.json")):
+    from .service import _has_systemd, _launchd_plist_path
+    has_archiver = (platform.system() == "Darwin" and _launchd_plist_path().exists()) or \
+                   (platform.system() != "Darwin" and _has_systemd())
+    if has_archiver:
         L.append("  " + c(
             "📁 Sessions archived to ~/.kiro_sessions/ — history persists across /clear and restarts",
             "dim", "green"))
