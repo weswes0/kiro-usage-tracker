@@ -8,7 +8,7 @@ import json, sys, os, time, signal
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import (CLI_DB, SESSIONS_DIR, CHARS_PER_TOKEN, calc_cost, query,
+from . import (CLI_DB, IDE_DB, SESSIONS_DIR, CHARS_PER_TOKEN, calc_cost, query,
                c, fmt, fmt_cost, bar, tw,
                vpad, vlpad, box_top, box_bot, box_sep, box_line)
 from .archiver import archive_sessions, load_archived_sessions
@@ -92,6 +92,64 @@ def load_all_sessions(days=None):
 
     return sorted(seen.values(), key=lambda x: x["updated"], reverse=True)
 
+# ── Load IDE usage (Kiro IDE token data) ──────────────────────────────────────
+# Before ~Feb 28 2026, tokens_prompt = full context (total API input per call).
+# After that, tokens_prompt = incremental only (new content per call).
+_IDE_CUTOVER = "2026-02-28"
+
+def load_ide_usage(days=None):
+    """Load Kiro IDE token data with cache-aware cost estimation."""
+    if not IDE_DB.exists():
+        return None
+    cutoff = ""
+    params = ()
+    if days and days < 9000:
+        cutoff = " WHERE timestamp >= datetime('now', ?)"
+        params = ("-{} days".format(days),)
+    rows = query(IDE_DB,
+        "SELECT tokens_prompt, tokens_generated, timestamp"
+        " FROM tokens_generated" + cutoff + " ORDER BY id", params)
+    if not rows:
+        return None
+
+    daily = {}
+    totals = {"input": 0, "out": 0, "cost": 0.0, "calls": 0}
+    # For new-format data: accumulate CacheRead within sessions
+    cum = 0
+    prev = 0
+
+    for r in rows:
+        p = r["tokens_prompt"] or 0
+        out = r["tokens_generated"] or 0
+        day = r["timestamp"][:10]
+        is_old = day < _IDE_CUTOVER
+
+        if is_old:
+            # tokens_prompt = full context; ~10% write, ~90% read
+            cw = int(p * 0.10)
+            cr = int(p * 0.90)
+            total_input = p
+        else:
+            # tokens_prompt = incremental (CacheWrite); derive CacheRead
+            if p < prev * 0.5:
+                cum = 0  # session reset
+            cw = p
+            cr = cum
+            cum += p
+            total_input = cw + cr
+            prev = p
+
+        tc = calc_cost(cw, cr, out)
+        totals["input"] += total_input
+        totals["out"] += out; totals["cost"] += tc; totals["calls"] += 1
+
+        if day not in daily:
+            daily[day] = {"input": 0, "out": 0, "cost": 0.0, "calls": 0}
+        daily[day]["input"] += total_input
+        daily[day]["out"] += out; daily[day]["cost"] += tc; daily[day]["calls"] += 1
+
+    return {**totals, "daily": daily}
+
 # ── Render ────────────────────────────────────────────────────────────────────
 def render(days):
     cli_convos = load_all_sessions(days)
@@ -104,6 +162,10 @@ def render(days):
     L.append("  " + c("Kiro Usage Tracker", "bold", "cyan") +
              "   " + c("{}  {}".format(label, now), "dim"))
     L.append("")
+
+    # Compute CLI cost-per-prompt-token ratio for IDE estimation
+    cli_total_cost = sum(cv["cost"] for cv in cli_convos) if cli_convos else 0
+    cli_total_prompt = sum(cv["cw"] + cv["cr"] for cv in cli_convos) if cli_convos else 0
 
     L.append(box_top("Terminal", w))
     if cli_convos:
@@ -122,8 +184,14 @@ def render(days):
                 c(fmt(t_cr), "yellow"), c(fmt(t_out), "blue"),
                 c(fmt_cost(t_cost), "red", "bold")), w))
         if all_models:
-            L.append(box_line(
-                "Models: " + "  ".join(c(m, "magenta") for m in sorted(all_models)), w))
+            # Count turns per model
+            model_counts = {}
+            for cv in cli_convos:
+                for m in cv["models"]:
+                    model_counts[m] = model_counts.get(m, 0) + cv["turns"]
+            parts = ["{}{}{}".format(c(m, "magenta"), c("x", "dim"), c(n, "bold"))
+                      for m, n in sorted(model_counts.items(), key=lambda x: -x[1])]
+            L.append(box_line("Models: " + "  ".join(parts), w))
 
         # Daily breakdown
         cli_daily = {}
@@ -174,14 +242,14 @@ def render(days):
                 cur += plen + 2
             L.append(box_line("Tools: " + "  ".join(parts), w))
 
-        # Sessions
+        # Sessions (recent only)
         L.append(box_sep(w))
         shdr = "{} {} {:>5} {:>7} {:>7} {:>6} {:>6} {}".format(
             vpad("ID", 8), vpad("Directory", 18),
             "Turns", "CWrite", "CRead", "Out", "Cost", "Updated")
         L.append(box_line(c(shdr, "dim"), w))
 
-        for cv in cli_convos:
+        for cv in cli_convos[:5]:
             cwd = cv["cwd"].replace(str(Path.home()), "~")
             if len(cwd) > 17:
                 cwd = ".." + cwd[-15:]
@@ -198,10 +266,23 @@ def render(days):
                 fmt(cv["cw"]), fmt(cv["cr"]), fmt(cv["out"]),
                 fmt_cost(cv["cost"]), updated)
             L.append(box_line(line, w))
+        if len(cli_convos) > 5:
+            L.append(box_line(c("  … and {} more sessions".format(
+                len(cli_convos) - 5), "dim"), w))
     else:
         L.append(box_line(c("No CLI data found.", "dim"), w))
 
     L.append(box_bot(w))
+
+    # ── IDE section (disabled — IDE only tracks partial prompt data) ─────
+    # ide = load_ide_usage(days)
+
+    # ── Total ─────────────────────────────────────────────────────────────
+    if cli_total_cost > 0:
+        L.append("")
+        L.append("  " + c("Estimated cost: ", "dim") +
+                 c(fmt_cost(cli_total_cost), "bold", "red"))
+
     L.append("  " + c(
         "📁 Sessions archived to ~/.kiro_sessions/ — history persists across /clear and restarts",
         "dim", "green"))
@@ -226,6 +307,10 @@ def live(days, interval=5):
 
 def view_json(days):
     cli_convos = load_all_sessions(days)
+    cli_total_cost = sum(cv["cost"] for cv in cli_convos) if cli_convos else 0
+    cli_total_prompt = sum(cv["cw"] + cv["cr"] for cv in cli_convos) if cli_convos else 0
+    cpp = cli_total_cost / cli_total_prompt if cli_total_prompt > 0 else None
+
     out = {"cli": {"daily": {}, "sessions": []}}
     for cv in cli_convos:
         for d, v in cv["daily"].items():
@@ -249,6 +334,10 @@ def view_json(days):
     for d in out["cli"]["daily"]:
         out["cli"]["daily"][d]["cost_est_usd"] = round(
             out["cli"]["daily"][d]["cost_est_usd"], 4)
+
+    # IDE disabled — data too incomplete for reliable estimates
+    # ide = load_ide_usage(days)
+    out["combined_cost_est_usd"] = round(cli_total_cost, 4)
     print(json.dumps(out, indent=2))
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
@@ -264,7 +353,7 @@ def main():
     no_live = "--no-live" in args
     if no_live:
         args.remove("--no-live")
-    cmd = args[0] if args else "today"
+    cmd = args[0] if args else "week"
 
     # Service management subcommands
     if cmd == "install":

@@ -6,8 +6,10 @@ from pathlib import Path
 # ── Platform paths ────────────────────────────────────────────────────────────
 if platform.system() == "Darwin":
     CLI_DB = Path.home() / "Library/Application Support/kiro-cli/data.sqlite3"
+    IDE_DB = Path.home() / "Library/Application Support/Kiro/User/globalStorage/kiro.kiroagent/dev_data/devdata.sqlite"
 else:
     CLI_DB = Path.home() / ".local/share/kiro-cli/data.sqlite3"
+    IDE_DB = Path.home() / ".config/Kiro/User/globalStorage/kiro.kiroagent/dev_data/devdata.sqlite"
 
 SESSIONS_DIR = Path.home() / ".kiro_sessions"
 CHARS_PER_TOKEN = 4
@@ -22,7 +24,7 @@ PRICING = {
     "claude-sonnet-4.5": (3.75, 0.30, 15),
     "claude-sonnet-4":   (3.75, 0.30, 15),
 }
-DEFAULT_PRICING = (6.25, 0.50, 25)
+DEFAULT_PRICING = (6.25, 0.50, 25)  # Opus — most common model
 
 def price_for(model_id):
     if not model_id:
