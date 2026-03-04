@@ -167,7 +167,7 @@ def render(days):
     cli_total_cost = sum(cv["cost"] for cv in cli_convos) if cli_convos else 0
     cli_total_prompt = sum(cv["cw"] + cv["cr"] for cv in cli_convos) if cli_convos else 0
 
-    L.append(box_top("Terminal", w))
+    L.append(box_top("Kiro-CLI", w))
     if cli_convos:
         t_cw   = sum(cv["cw"]   for cv in cli_convos)
         t_cr   = sum(cv["cr"]   for cv in cli_convos)
@@ -283,9 +283,10 @@ def render(days):
         L.append("  " + c("Estimated cost: ", "dim") +
                  c(fmt_cost(cli_total_cost), "bold", "red"))
 
-    L.append("  " + c(
-        "📁 Sessions archived to ~/.kiro_sessions/ — history persists across /clear and restarts",
-        "dim", "green"))
+    if any(SESSIONS_DIR.glob("*.json")):
+        L.append("  " + c(
+            "📁 Sessions archived to ~/.kiro_sessions/ — history persists across /clear and restarts",
+            "dim", "green"))
     L.append("")
     return "\n".join(L)
 
