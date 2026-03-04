@@ -9,6 +9,21 @@ description = "Track token usage and costs across Kiro CLI sessions"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
+keywords = [
+    "kiro",
+    "kiro-cli",
+    "kiro-usage",
+    "token-usage",
+    "token-tracker",
+    "ai-cost",
+    "llm-cost",
+    "claude",
+    "anthropic",
+    "usage-monitor",
+    "terminal-dashboard",
+    "rich",
+    "developer-tools",
+]
 classifiers = [
     "Environment :: Console",
     "Topic :: Utilities",
