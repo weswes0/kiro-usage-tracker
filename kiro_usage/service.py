@@ -120,11 +120,19 @@ def _systemd_uninstall():
     return True
 
 # ── Public API ────────────────────────────────────────────────────────────────
+def _has_systemd():
+    return shutil.which("systemctl") is not None
+
 def install():
     if platform.system() == "Darwin":
         ok = _launchd_install()
-    else:
+    elif _has_systemd():
         ok = _systemd_install()
+    else:
+        print("⚠️  No service manager found (no systemd/launchd).")
+        print("   The viewer will read directly from the Kiro CLI database.")
+        print("   Note: history won't persist across /clear or DB resets.")
+        return True
     if ok:
         print("✅ Archiver installed and running.")
         print("   Sessions will be archived to ~/.kiro_sessions/")
@@ -133,8 +141,11 @@ def install():
 def uninstall():
     if platform.system() == "Darwin":
         ok = _launchd_uninstall()
-    else:
+    elif _has_systemd():
         ok = _systemd_uninstall()
+    else:
+        print("No service manager — nothing to uninstall.")
+        return True
     if ok:
         print("✅ Archiver uninstalled.")
     return ok
@@ -157,8 +168,10 @@ def status():
             print("Archiver: loaded")
         else:
             print("Archiver: installed but not running")
-    else:
+    elif _has_systemd():
         r = subprocess.run(
             ["systemctl", "--user", "is-active", "kiro-usage-archiver"],
             capture_output=True, text=True)
         print("Archiver: {}".format(r.stdout.strip() or "not installed"))
+    else:
+        print("Archiver: not available (no service manager, using direct DB reads)")
