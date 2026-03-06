@@ -11,20 +11,62 @@ from pathlib import Path
 from . import (CLI_DB, IDE_DB, SESSIONS_DIR, CHARS_PER_TOKEN, calc_cost, query,
                c, fmt, fmt_cost, bar, tw,
                vpad, vlpad, box_top, box_bot, box_sep, box_line)
-from .archiver import archive_sessions, load_archived_sessions
+from .archiver import load_archived_sessions
+
+_cache = {}  # conversation_id -> parsed result (keyed by updated_at)
+
+# ── Measure text size of a turn field, excluding base64 images ────────────────
+def _text_len(field):
+    """Return char length of the textual content in a user/assistant field."""
+    if not field:
+        return 0
+    if not isinstance(field, dict):
+        return len(str(field))
+    # Exclude 'images' (base64 blobs) from the count
+    return sum(len(str(v)) for k, v in field.items() if k != "images")
+
+
+def _image_tokens(field):
+    """Estimate vision tokens for images in a user turn. ~(w*h)/750 per image."""
+    if not isinstance(field, dict):
+        return 0
+    images = field.get("images")
+    if not images or not isinstance(images, list):
+        return 0
+    import struct, base64
+    total = 0
+    for img in images:
+        src = img.get("source", {}) if isinstance(img, dict) else {}
+        raw_data = src.get("Bytes", [])
+        try:
+            raw = bytes(raw_data) if isinstance(raw_data, list) else base64.b64decode(raw_data)
+            if raw[:4] == b'\x89PNG':
+                w, h = struct.unpack('>II', raw[16:24])
+                total += (w * h) // 750
+                continue
+        except Exception:
+            pass
+        # Fallback: estimate from data size (~1600 tokens for a typical image)
+        total += 1600
+    return total
+
 
 # ── Parse a single conversation snapshot into display-ready stats ─────────────
 def parse_conversation(conv_id, cwd, created_at_ms, updated_at_ms, data):
     turns = data.get("history", [])
     totals = {"cw": 0, "cr": 0, "out": 0, "cost": 0.0}
-    cumulative, prev_asst = 0, 0
+    # Seed cumulative with compact summary size so post-compact cache reads
+    # account for the summary context that is re-sent every turn.
+    summary = data.get("latest_summary") or []
+    summary_tok = len(str(summary)) // CHARS_PER_TOKEN if summary else 0
+    cumulative, prev_asst = summary_tok, 0
     models, tools = set(), []
     daily = {}
 
     for i, turn in enumerate(turns):
         meta = turn.get("request_metadata") or {}
-        user_tok = len(json.dumps(turn.get("user", {}))) // CHARS_PER_TOKEN
-        asst_tok = len(json.dumps(turn.get("assistant", {}))) // CHARS_PER_TOKEN
+        user_tok = _text_len(turn.get("user")) // CHARS_PER_TOKEN + _image_tokens(turn.get("user"))
+        asst_tok = _text_len(turn.get("assistant")) // CHARS_PER_TOKEN
         out_tok = len(meta.get("time_between_chunks", []))
         model = meta.get("model_id")
 
@@ -66,29 +108,41 @@ def load_all_sessions(days=None):
     if days and days < 9000:
         cutoff_ms = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
 
-    archive_sessions()
     seen = {}
 
-    for snap in load_archived_sessions():
-        if cutoff_ms and snap["updated_at"] < cutoff_ms:
+    for snap in load_archived_sessions(cutoff_ms):
+        cid = snap["conversation_id"]
+        updated = snap["updated_at"]
+        if cid in _cache and _cache[cid]["_updated_at"] == updated:
+            seen[cid] = _cache[cid]
+            continue
+        if cutoff_ms and updated < cutoff_ms:
             continue
         try:
-            seen[snap["conversation_id"]] = parse_conversation(
-                snap["conversation_id"], snap["cwd"],
-                snap["created_at"], snap["updated_at"], snap["value"])
+            parsed = parse_conversation(
+                cid, snap["cwd"], snap["created_at"], updated, snap["value"])
+            parsed["_updated_at"] = updated
+            _cache[cid] = parsed
+            seen[cid] = parsed
         except Exception:
             continue
 
     for row in query(CLI_DB, "SELECT conversation_id, key as cwd, created_at, updated_at, value FROM conversations_v2 ORDER BY updated_at DESC"):
-        if cutoff_ms and row["updated_at"] < cutoff_ms:
+        cid = row["conversation_id"]
+        updated = row["updated_at"]
+        if cutoff_ms and updated < cutoff_ms:
+            continue
+        if cid in _cache and _cache[cid]["_updated_at"] == updated:
+            seen[cid] = _cache[cid]
             continue
         try:
             data = json.loads(row["value"])
         except Exception:
             continue
-        seen[row["conversation_id"]] = parse_conversation(
-            row["conversation_id"], row["cwd"],
-            row["created_at"], row["updated_at"], data)
+        parsed = parse_conversation(cid, row["cwd"], row["created_at"], updated, data)
+        parsed["_updated_at"] = updated
+        _cache[cid] = parsed
+        seen[cid] = parsed
 
     return sorted(seen.values(), key=lambda x: x["updated"], reverse=True)
 
@@ -151,7 +205,7 @@ def load_ide_usage(days=None):
     return {**totals, "daily": daily}
 
 # ── Render ────────────────────────────────────────────────────────────────────
-def render(days):
+def render(days, max_sessions=5):
     cli_convos = load_all_sessions(days)
     w = min(tw(), 120)
     L = []
@@ -249,7 +303,7 @@ def render(days):
             "Turns", "CWrite", "CRead", "Out", "Cost", "Updated")
         L.append(box_line(c(shdr, "dim"), w))
 
-        for cv in cli_convos[:5]:
+        for cv in cli_convos[:max_sessions]:
             cwd = cv["cwd"].replace(str(Path.home()), "~")
             if len(cwd) > 17:
                 cwd = ".." + cwd[-15:]
@@ -266,9 +320,9 @@ def render(days):
                 fmt(cv["cw"]), fmt(cv["cr"]), fmt(cv["out"]),
                 fmt_cost(cv["cost"]), updated)
             L.append(box_line(line, w))
-        if len(cli_convos) > 5:
-            L.append(box_line(c("  … and {} more sessions".format(
-                len(cli_convos) - 5), "dim"), w))
+        if len(cli_convos) > max_sessions:
+            L.append(box_line(c("  … and {} more (use --all to show)".format(
+                len(cli_convos) - max_sessions), "dim"), w))
     else:
         L.append(box_line(c("No CLI data found.", "dim"), w))
 
@@ -293,17 +347,82 @@ def render(days):
     L.append("")
     return "\n".join(L)
 
+# ── Session detail view ───────────────────────────────────────────────────────
+def render_session(prefix):
+    """Show per-turn breakdown for a session matching the given ID prefix."""
+    # Find matching conversation from all sources
+    data, cid, cwd = None, None, None
+    for snap in load_archived_sessions():
+        if snap["conversation_id"].startswith(prefix):
+            data, cid, cwd = snap["value"], snap["conversation_id"], snap["cwd"]
+    for row in query(CLI_DB, "SELECT conversation_id, key as cwd, value FROM conversations_v2"):
+        if row["conversation_id"].startswith(prefix):
+            data, cid, cwd = json.loads(row["value"]), row["conversation_id"], row["cwd"]
+
+    if not data:
+        return "No session found matching '{}'".format(prefix)
+
+    turns = data.get("history", [])
+    summary = data.get("latest_summary") or []
+    summary_tok = len(str(summary)) // CHARS_PER_TOKEN if summary else 0
+    cumulative, prev_asst = summary_tok, 0
+    w = min(tw(), 120)
+    L = [""]
+    L.append("  " + c("Session ", "bold", "cyan") + c(cid[:8], "cyan") +
+             "   " + c(cwd.replace(str(Path.home()), "~"), "dim"))
+    if summary_tok:
+        L.append("  " + c("Compact summary: ~{} tokens carried forward".format(
+            fmt(summary_tok)), "dim"))
+    L.append("")
+
+    hdr = " {:>4}  {:>6}  {:>8}  {:>8}  {:>6}  {:>7}  {}".format(
+        "#", "Out", "CWrite", "CRead", "Cost", "Model", "Time")
+    L.append(c(hdr, "dim"))
+
+    total_cost = 0.0
+    for i, turn in enumerate(turns):
+        meta = turn.get("request_metadata") or {}
+        user_tok = _text_len(turn.get("user")) // CHARS_PER_TOKEN + _image_tokens(turn.get("user"))
+        asst_tok = _text_len(turn.get("assistant")) // CHARS_PER_TOKEN
+        out_tok = len(meta.get("time_between_chunks", []))
+        model = meta.get("model_id") or ""
+
+        cr = cumulative if i > 0 else 0
+        cw = user_tok + (prev_asst if i > 0 else 0)
+        tc = calc_cost(cw, cr, out_tok, model)
+        total_cost += tc
+        cumulative += user_tok + asst_tok
+        prev_asst = asst_tok
+
+        ts_ms = meta.get("request_start_timestamp_ms")
+        ts = datetime.fromtimestamp(ts_ms / 1000).strftime("%H:%M:%S") if ts_ms else ""
+        model_short = model.replace("claude-", "").replace("claude_", "")[:12]
+
+        tools_used = [t[1] for t in meta.get("tool_use_ids_and_names", []) if len(t) > 1]
+        tool_str = "  " + c(",".join(tools_used[:3]), "dim") if tools_used else ""
+
+        line = " {:>4}  {:>6}  {:>8}  {:>8}  {:>6}  {:>7}  {}{}".format(
+            i, out_tok, fmt(cw), fmt(cr), fmt_cost(tc), model_short, ts, tool_str)
+        L.append(line)
+
+    L.append("")
+    L.append("  " + c("Total: ", "dim") + c(fmt_cost(total_cost), "bold", "red") +
+             c("  ({} turns)".format(len(turns)), "dim"))
+    L.append("")
+    return "\n".join(L)
+
+
 # ── Modes ─────────────────────────────────────────────────────────────────────
 def _clear():
     sys.stdout.write("\033[2J\033[H"); sys.stdout.flush()
 
-def live(days, interval=5):
+def live(days, interval=5, max_sessions=5):
     signal.signal(signal.SIGINT, lambda *_: (sys.stdout.write("\033[?25h\n"), sys.exit(0)))
     sys.stdout.write("\033[?25l")
     try:
         while True:
             _clear()
-            print(render(days))
+            print(render(days, max_sessions))
             print(c("  ⏸  Ctrl+C to exit  │  🔄 refreshing every {}s".format(interval), "dim"))
             time.sleep(interval)
     finally:
@@ -357,6 +476,9 @@ def main():
     no_live = "--no-live" in args
     if no_live:
         args.remove("--no-live")
+    show_all = "--all" in args
+    if show_all:
+        args.remove("--all")
     cmd = args[0] if args else "week"
 
     # Service management subcommands
@@ -368,6 +490,13 @@ def main():
         return
     if cmd == "status":
         service.status()
+        return
+    if cmd == "session":
+        sid = args[1] if len(args) > 1 else ""
+        if not sid:
+            print("Usage: kiro-usage session <id-prefix>")
+            sys.exit(1)
+        print(render_session(sid))
         return
 
     if cmd in ("help", "-h", "--help"):
@@ -381,6 +510,7 @@ def main():
     week      Last 7 days
     month     Last 30 days
     all       All time
+    session   Per-turn detail for a session (kiro-usage session <id>)
     install   Register background archiver as a system service
     uninstall Remove background archiver service
     status    Show archiver service status
@@ -418,12 +548,14 @@ def main():
         print("Unknown command: " + cmd)
         sys.exit(1)
 
+    ms = 9999 if show_all else 5
+
     if as_json:
         view_json(period)
     elif no_live or not sys.stdout.isatty():
-        print(render(period))
+        print(render(period, ms))
     else:
-        live(period)
+        live(period, max_sessions=ms)
 
 if __name__ == "__main__":
     main()

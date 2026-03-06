@@ -39,11 +39,15 @@ def archive_sessions():
         archived += 1
     return archived
 
-def load_archived_sessions():
+def load_archived_sessions(cutoff_ms=None):
     """Load all snapshots from ~/.kiro_sessions/."""
     ensure_sessions_dir()
     sessions = []
     for path in SESSIONS_DIR.glob("*.json"):
+        if cutoff_ms:
+            mtime_ms = int(path.stat().st_mtime * 1000)
+            if mtime_ms < cutoff_ms:
+                continue
         try:
             sessions.append(json.loads(path.read_text()))
         except (json.JSONDecodeError, OSError):
