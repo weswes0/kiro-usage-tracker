@@ -54,6 +54,8 @@ def _image_tokens(field):
 # ── Parse a single conversation snapshot into display-ready stats ─────────────
 def parse_conversation(conv_id, cwd, created_at_ms, updated_at_ms, data):
     turns = data.get("history", [])
+    # Filter out non-dict turns (incompatible schema entries)
+    turns = [t for t in turns if isinstance(t, dict)]
     totals = {"cw": 0, "cr": 0, "out": 0, "cost": 0.0}
     # Seed cumulative with compact summary size so post-compact cache reads
     # account for the summary context that is re-sent every turn.
@@ -155,6 +157,9 @@ def load_all_sessions(days=None):
             continue
         turns = data.get("history", [])
         if not turns:
+            continue
+        # Skip if turns contain non-dict items (incompatible schema)
+        if not isinstance(turns[0], dict):
             continue
         first_ts = (turns[0].get("request_metadata") or {}).get("request_start_timestamp_ms")
         last_ts = (turns[-1].get("request_metadata") or {}).get("request_start_timestamp_ms")
@@ -447,17 +452,60 @@ def render_session(prefix):
 
 # ── Modes ─────────────────────────────────────────────────────────────────────
 def _clear():
-    sys.stdout.write("\033[2J\033[H"); sys.stdout.flush()
+    # Move cursor to home without clearing — overwrite in place (no flicker)
+    sys.stdout.write("\033[H\033[J"); sys.stdout.flush()
 
 def live(days, interval=5, max_sessions=5):
+    import threading
     signal.signal(signal.SIGINT, lambda *_: (sys.stdout.write("\033[?25h\n"), sys.exit(0)))
     sys.stdout.write("\033[?25l")
+
+    _lock = threading.Lock()
+    _state = {"text": None, "version": 0, "loading": False, "data_time": ""}
+
+    def _loader():
+        while True:
+            new_text = render(days, max_sessions)
+            with _lock:
+                _state["text"] = new_text
+                _state["version"] += 1
+                _state["loading"] = False
+                _state["data_time"] = datetime.now().strftime("%H:%M:%S")
+            time.sleep(interval)
+            with _lock:
+                _state["loading"] = True
+
+    t = threading.Thread(target=_loader, daemon=True)
+    t.start()
+
+    displayed_version = -1
     try:
         while True:
-            _clear()
-            print(render(days, max_sessions))
-            print(c("  ⏸  Ctrl+C to exit  │  🔄 refreshing every {}s".format(interval), "dim"))
-            time.sleep(interval)
+            with _lock:
+                version = _state["version"]
+                text = _state["text"]
+                loading = _state["loading"]
+                data_time = _state["data_time"]
+
+            now = datetime.now().strftime("%H:%M:%S")
+            status = "  🕐 {} │  📊 data: {}".format(now, data_time)
+            if loading:
+                status += "  ⏳ loading..."
+
+            if version != displayed_version and text is not None:
+                _clear()
+                print(c(status, "dim"))
+                print(text)
+                print(c("  ⏸  Ctrl+C to exit", "dim"))
+                displayed_version = version
+            else:
+                # Only update the top status line in place
+                sys.stdout.write("\033[H")  # cursor to home
+                sys.stdout.write("\033[2K")  # clear first line
+                sys.stdout.write(c(status, "dim"))
+                sys.stdout.flush()
+
+            time.sleep(1)
     finally:
         sys.stdout.write("\033[?25h")
 
